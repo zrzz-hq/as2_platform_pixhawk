@@ -427,10 +427,6 @@ void PixhawkPlatform::resetTrajectorySetpoint()
 
 void PixhawkPlatform::resetAttitudeSetpoint()
 {
-  px4_attitude_setpoint_.pitch_body = NAN;
-  px4_attitude_setpoint_.roll_body = NAN;
-  px4_attitude_setpoint_.yaw_body = NAN;
-
   px4_attitude_setpoint_.q_d = std::array<float, 4>{0, 0, 0, 1};
   px4_attitude_setpoint_.thrust_body = std::array<float, 3>{0, 0, -min_thrust_};
 }
@@ -670,6 +666,22 @@ void PixhawkPlatform::px4odometryCallback(const px4_msgs::msg::VehicleOdometry::
         odom_msg.pose.pose.orientation.x = q_flu.x();
         odom_msg.pose.pose.orientation.y = q_flu.y();
         odom_msg.pose.pose.orientation.z = q_flu.z();
+
+        // Leaving this at the default zero makes downstream EKFs (robot_localization)
+        // treat the measurement as having zero uncertainty, so they snap to every
+        // noisy sample instead of blending it with their prediction. PX4 exposes its
+        // own EKF2 uncertainty estimates, so use those instead of leaving this unset.
+        Eigen::Vector3d pos_variance_ned(
+          msg->position_variance[0], msg->position_variance[1], msg->position_variance[2]);
+        Eigen::Vector3d pos_variance_enu = ned_enu_reflection_xy * pos_variance_ned;
+        odom_msg.pose.covariance[0] = pos_variance_enu[0];   // x
+        odom_msg.pose.covariance[7] = pos_variance_enu[1];   // y
+        odom_msg.pose.covariance[14] = pos_variance_enu[2];  // z
+        // orientation_variance is roll/pitch/yaw in the body frame; NED/FRD -> ENU/FLU
+        // only flips axis signs here (no axis permutation), which doesn't affect variance.
+        odom_msg.pose.covariance[21] = msg->orientation_variance[0];  // roll
+        odom_msg.pose.covariance[28] = msg->orientation_variance[1];  // pitch
+        odom_msg.pose.covariance[35] = msg->orientation_variance[2];  // yaw
         break;
       }
     default:
@@ -704,6 +716,13 @@ void PixhawkPlatform::px4odometryCallback(const px4_msgs::msg::VehicleOdometry::
         odom_msg.twist.twist.linear.x = vel_flu[0];
         odom_msg.twist.twist.linear.y = vel_flu[1];
         odom_msg.twist.twist.linear.z = vel_flu[2];
+
+        Eigen::Vector3d vel_variance_ned(
+          msg->velocity_variance[0], msg->velocity_variance[1], msg->velocity_variance[2]);
+        Eigen::Vector3d vel_variance_enu = ned_enu_reflection_xy * vel_variance_ned;
+        odom_msg.twist.covariance[0] = vel_variance_enu[0];   // vx
+        odom_msg.twist.covariance[7] = vel_variance_enu[1];   // vy
+        odom_msg.twist.covariance[14] = vel_variance_enu[2];  // vz
         break;
       }
     case px4_msgs::msg::VehicleOdometry::VELOCITY_FRAME_BODY_FRD: {
@@ -711,6 +730,11 @@ void PixhawkPlatform::px4odometryCallback(const px4_msgs::msg::VehicleOdometry::
         odom_msg.twist.twist.linear.x = msg->velocity[0];
         odom_msg.twist.twist.linear.y = -msg->velocity[1];
         odom_msg.twist.twist.linear.z = -msg->velocity[2];
+
+        // Already body-frame; sign flips above don't affect variance magnitude.
+        odom_msg.twist.covariance[0] = msg->velocity_variance[0];
+        odom_msg.twist.covariance[7] = msg->velocity_variance[1];
+        odom_msg.twist.covariance[14] = msg->velocity_variance[2];
         break;
       }
     default:
@@ -722,6 +746,13 @@ void PixhawkPlatform::px4odometryCallback(const px4_msgs::msg::VehicleOdometry::
   odom_msg.twist.twist.angular.x = msg->angular_velocity[0];
   odom_msg.twist.twist.angular.y = -msg->angular_velocity[1];
   odom_msg.twist.twist.angular.z = -msg->angular_velocity[2];
+
+  // PX4 doesn't expose an angular velocity variance, only attitude variance. Reuse
+  // orientation_variance as a rough proxy rather than leaving this at zero, which
+  // would make yaw-rate fusion (odom0_config vyaw) trust every noisy sample fully.
+  odom_msg.twist.covariance[21] = msg->orientation_variance[0];
+  odom_msg.twist.covariance[28] = msg->orientation_variance[1];
+  odom_msg.twist.covariance[35] = msg->orientation_variance[2];
 
   odometry_raw_estimation_ptr_->updateData(odom_msg);
 }
@@ -776,9 +807,9 @@ void PixhawkPlatform::px4GpsCallback(const px4_msgs::msg::SensorGps::SharedPtr m
   }
   nav_sat_fix_msg.status.service = sensor_msgs::msg::NavSatStatus::SERVICE_GPS;  // DEFAULT
 
-  nav_sat_fix_msg.latitude = msg->lat;
-  nav_sat_fix_msg.longitude = msg->lon;
-  nav_sat_fix_msg.altitude = msg->alt_ellipsoid;
+  nav_sat_fix_msg.latitude = msg->latitude_deg;
+  nav_sat_fix_msg.longitude = msg->longitude_deg;
+  nav_sat_fix_msg.altitude = msg->altitude_ellipsoid_m;
 
   if (!std::isnan(msg->eph) && !std::isnan(msg->epv)) {
     // Position uncertainty --> Diagonal known
@@ -793,10 +824,6 @@ void PixhawkPlatform::px4GpsCallback(const px4_msgs::msg::SensorGps::SharedPtr m
     nav_sat_fix_msg.position_covariance = {-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     nav_sat_fix_msg.position_covariance_type = sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_UNKNOWN;
   }
-  nav_sat_fix_msg.latitude = nav_sat_fix_msg.latitude / 1e7;
-  nav_sat_fix_msg.longitude = nav_sat_fix_msg.longitude / 1e7;
-  nav_sat_fix_msg.altitude = nav_sat_fix_msg.altitude / 1e3;
-
   gps_sensor_ptr_->updateData(nav_sat_fix_msg);
 }
 
@@ -812,7 +839,7 @@ void PixhawkPlatform::px4BatteryCallback(const px4_msgs::msg::BatteryStatus::Sha
   battery_msg.current = msg->current_a;
   battery_msg.charge = NAN;
   battery_msg.capacity = msg->capacity;
-  battery_msg.design_capacity = msg->design_capacity;
+  battery_msg.design_capacity = static_cast<float>(msg->capacity);
   battery_msg.percentage = 100.0 * msg->remaining;
   // TODO(miferco97): config file with battery settings
   battery_msg.power_supply_status = sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_UNKNOWN;
@@ -824,7 +851,7 @@ void PixhawkPlatform::px4BatteryCallback(const px4_msgs::msg::BatteryStatus::Sha
   battery_msg.cell_voltage = {};
   battery_msg.cell_temperature = {};
   battery_msg.location = '0';
-  battery_msg.serial_number = std::to_string(msg->serial_number);
+  battery_msg.serial_number = std::to_string(msg->id);
 
   if (msg->warning >= 0) {
     RCLCPP_WARN_ONCE(this->get_logger(), "Battery warning #%d", msg->warning);
